@@ -1,0 +1,125 @@
+name: Upstream sync watcher
+
+# Detects when digitalpulsebe/craft-multi-translator (upstream) ships a new stable
+# release and opens an alert issue telling a maintainer to rebase the `category-support`
+# integration branch. It NEVER rewrites `category-support` itself — auto-force-pushing a
+# branch that a production project pins is exactly what we avoid. Detection + alerting
+# only; a human runs the rebase per FORK-MAINTENANCE.md.
+#
+# Runs from the default branch (GitHub only schedules workflows defined on the default
+# branch). See FORK-MAINTENANCE.md for the branch model and the manual runbook.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'        # every Monday 06:00 UTC
+  workflow_dispatch: {}         # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history + tags + all branches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream https://github.com/digitalpulsebe/craft-multi-translator.git
+          git fetch upstream --tags --quiet
+          git config user.name "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
+
+      - name: Determine latest upstream stable tag and current base
+        id: detect
+        run: |
+          set -euo pipefail
+          # Highest non-prerelease tag (prereleases contain a hyphen).
+          latest_stable="$(git tag --list --sort=-v:refname | grep -vE '-' | head -1)"
+          # category-support is "<stable tag> + 1 commit", so its parent is the base tag.
+          if base_tag="$(git describe --tags --exact-match origin/category-support~1 2>/dev/null)"; then
+            current_base="$base_tag"
+          else
+            current_base="unknown"
+          fi
+          echo "latest_stable=$latest_stable" >> "$GITHUB_OUTPUT"
+          echo "current_base=$current_base"   >> "$GITHUB_OUTPUT"
+          if [ "$latest_stable" != "$current_base" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Latest upstream stable: $latest_stable | category-support base: $current_base"
+
+      - name: Test-rebase category-support onto the new tag (scratch, no push)
+        id: testrebase
+        if: steps.detect.outputs.needs_update == 'true'
+        run: |
+          latest_stable="${{ steps.detect.outputs.latest_stable }}"
+          git checkout -b _scratch origin/category-support
+          if git rebase "$latest_stable" >/tmp/rebase.log 2>&1; then
+            echo "status=CLEAN" >> "$GITHUB_OUTPUT"
+            echo "conflicts=" >> "$GITHUB_OUTPUT"
+          else
+            conflicts="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            git rebase --abort || true
+            echo "status=CONFLICT" >> "$GITHUB_OUTPUT"
+            echo "conflicts=$conflicts" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update alert issue
+        if: steps.detect.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_stable="${{ steps.detect.outputs.latest_stable }}"
+          current_base="${{ steps.detect.outputs.current_base }}"
+          status="${{ steps.testrebase.outputs.status }}"
+          conflicts="${{ steps.testrebase.outputs.conflicts }}"
+          title="Upstream ${latest_stable} available — rebase category-support"
+
+          if [ "$status" = "CLEAN" ]; then
+            rebase_line="**Rebase status: CLEAN ✅** — the Category commit replays onto \`${latest_stable}\` with no conflicts."
+          else
+            rebase_line="**Rebase status: CONFLICT ❌** in: \`${conflicts}\` — resolve during the rebase (CHANGELOG.md is the usual suspect)."
+          fi
+
+          body=$(cat <<EOF
+          Upstream released **${latest_stable}**. The \`category-support\` integration branch is currently based on **${current_base}**.
+
+          ${rebase_line}
+
+          ### What to do
+          Follow the runbook in [FORK-MAINTENANCE.md](../blob/develop/FORK-MAINTENANCE.md):
+
+          \`\`\`bash
+          git fetch upstream --tags && git push origin --tags
+          git checkout develop && git merge upstream/develop && git push origin develop
+          git checkout category-support
+          git rebase ${latest_stable}
+          git push --force-with-lease origin category-support
+          # then bump the consuming project's alias to "dev-category-support as ${latest_stable}"
+          # and run: composer update digitalpulsebe/craft-multi-translator --with-dependencies
+          \`\`\`
+
+          _Opened automatically by the upstream-sync watcher. Close this issue once the rebase is done._
+          EOF
+          )
+
+          existing="$(gh issue list --state open --search "in:title $title" --json number --jq '.[0].number' || true)"
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "Updated existing issue #$existing"
+          else
+            gh issue create --title "$title" --body "$body" --label "upstream-sync" || \
+            gh issue create --title "$title" --body "$body"
+            echo "Created new alert issue"
+          fi
+
+      - name: Up to date
+        if: steps.detect.outputs.needs_update == 'false'
+        run: echo "category-support is already based on the latest upstream stable (${{ steps.detect.outputs.current_base }})."
